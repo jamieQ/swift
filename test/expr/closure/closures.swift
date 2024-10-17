@@ -552,6 +552,8 @@ do {
 
   class C {
     init() {
+      // expected-warning@+3{{weak/unowned capture implicitly captured as strong reference in outer scope}}
+      // expected-note@+2{{weak/unowned capture implicitly captured here}}
       // expected-warning@+1{{capture 'self' was never used}}
       let _ = f { fn in { [unowned self, fn] x in x != 1000 ? fn(x + 1) : "success" } }(0)
     }
@@ -1835,6 +1837,30 @@ extension TestExtensionOnOptionalSelf? {
     _ = { [weak self] in
       _ = { [self] in // expected-warning {{capture 'self' was never used}}
         foo()
+      }
+    }
+  }
+}
+
+class TestImplicitWeakToStrongCaptures {
+  func test_self() {
+    doVoidStuff { // expected-note {{weak/unowned capture implicitly captured here}}
+      doVoidStuff { [weak self] in  // expected-warning {{weak/unowned capture implicitly captured as strong reference in outer scope}}
+        _ = self
+      }
+    }
+  }
+
+  func test_locals() {
+    let a = SomeClass()
+    doVoidStuff { // expected-note {{weak/unowned capture implicitly captured here}}
+      let b = SomeClass()
+      doVoidStuff { [
+        weak a, // expected-warning {{weak/unowned capture implicitly captured as strong reference in outer scope}}
+        weak b
+      ] in
+        _ = a
+        _ = b
       }
     }
   }
