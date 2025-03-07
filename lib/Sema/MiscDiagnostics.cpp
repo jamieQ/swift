@@ -2596,16 +2596,17 @@ static void diagnoseImplicitWeakToStrongCapture(const Expr *E,
                                                 const DeclContext *DC) {
   if (!E || isa<ErrorExpr>(E) || !E->getType())
     return;
-  
+
   class DiagnoseWalker : public BaseDiagnosticWalker {
-  public:
     ASTContext &Ctx;
 
-    /// Set of DeclRefExpr from weak/unowned capture list entries whose
-    /// DeclRefExpr's corresponding Decl has strong ownership (i.e. the capture
-    /// list entry changed ownership from strong to weak/unowned).
-    llvm::SetVector<const DeclRefExpr *> NonStrongToStrongCaptureListDeclRefs;
+  public:
+    DiagnoseWalker(ASTContext &ctx) : Ctx(ctx) {}
 
+    /// Info regarding weak/unowned capture list items who have simple inits
+    /// binding to a DeclRefExpr with a corresponding Decl that has strong
+    /// ownership (i.e. the capture list item changed ownership from strong
+    /// to weak/unowned).
     struct WeakToStrongCaptureItemInfo {
       VarDecl *itemDecl;
       ValueDecl *itemReferent;
@@ -2613,37 +2614,51 @@ static void diagnoseImplicitWeakToStrongCapture(const Expr *E,
       ReferenceOwnership itemDeclOwnership;
     };
 
+    /// Collection of capture item info to potentially diagnose
     llvm::SmallVector<WeakToStrongCaptureItemInfo, 4> WeakToStrongCaptureItems;
 
-    /// Stack to for tracking current closure expression context
+    /// Stack for tracking the current closure expression context
     llvm::SmallVector<AbstractClosureExpr *, 8> ClosureStack;
 
     /// Tracks DeclRefExprs and associates them with the currently-known closure
     /// context.
     llvm::SmallDenseMap<AbstractClosureExpr *, llvm::SetVector<DeclRefExpr *>> ClosuresToDeclRefs;
 
-    static ReferenceOwnership getVarDeclOwnership(const VarDecl *VD) {
-      if (auto *attr = VD->getAttrs().getAttribute<ReferenceOwnershipAttr>()) {
+    static ReferenceOwnership getDeclOwnership(const Decl *D) {
+      if (auto attr = D->getAttrs().getAttribute<ReferenceOwnershipAttr>()) {
         return attr->get();
       }
-      return ReferenceOwnership::Strong; // Default to strong if unspecified
+      // Default to strong if unspecified
+      return ReferenceOwnership::Strong;
     }
 
-    static bool declHasLessThanStrongOwnership(const Decl *D) {
-      if (auto attr = D->getAttrs().getAttribute<ReferenceOwnershipAttr>()) {
-        return isLessStrongThan(attr->get(), ReferenceOwnership::Strong);
-      }
+    static bool isLessThanStrongOwnership(const ReferenceOwnership ownership) {
+      return isLessStrongThan(ownership, ReferenceOwnership::Strong);
+    }
+
+    static bool isEscapingClosure(const AbstractClosureExpr *ACE) {
+      return !ACE->getType()->isNoEscape();
+    }
+
+    static bool
+    isDeclACaptureListItemOfClosure(const Decl *D,
+                                    const AbstractClosureExpr *ACE) {
+      if (auto VD = dyn_cast<VarDecl>(D))
+        if (auto CLE = VD->getParentCaptureList())
+          if (CLE->getClosureBody() == ACE)
+            return true;
+
       return false;
     }
 
     // We're looking for captures like [weak a], [unowned a = b]
     // here, where the bound DeclRef has strong ownership. If we find a
-    // candidate pattern, dig out the DeclRefExpr from the expected location
+    // candidate pattern, dig out a DeclRefExpr from some expected locations
     // and record it. These will be used to diagnose capture list entries that
     // bind a weak/unowned var but in so doing induce an implicit strong
     // capture of the associated Decl an ancestor escaping closure's scope.
-    void recordCaptureListDeclIfNeeded(Decl *D) {
-      // Only care about pattern bindings
+    void recordWeakifiedCaptureListDeclIfNeeded(Decl *D) {
+      // We only care about pattern bindings
       auto PBD = dyn_cast<PatternBindingDecl>(D);
       if (!PBD)
         return;
@@ -2652,78 +2667,57 @@ static void diagnoseImplicitWeakToStrongCapture(const Expr *E,
       auto VD = PBD->getSingleVar();
       if (!VD)
         return;
-      
-      // If this isn't a capture list binding, ignore it
+
+      // If this isn't part of a capture list, ignore it
       if (!VD->isCaptureList())
         return;
       
       // If the capture list Decl is not weak/unowned, ignore it
-      auto ownership = getVarDeclOwnership(VD);
-      if (!isLessStrongThan(ownership, ReferenceOwnership::Strong))
+      auto ownership = getDeclOwnership(VD);
+      if (!isLessThanStrongOwnership(ownership))
         return;
       
       // Get the initialization expression
       auto init = PBD->getInit(0);
-      if (!init)
+      if (!init) // TODO: is this possible?
         return;
       
       ValueDecl *referencedDecl = init->getReferencedDecl().getDecl();
 
       // If we didn't find a referenced Decl for some reason, or it doesn't
       // have strong ownership, there's nothing to diagnose.
-      if (!referencedDecl || declHasLessThanStrongOwnership(referencedDecl))
+      if (!referencedDecl ||
+          isLessThanStrongOwnership(getDeclOwnership(referencedDecl)))
         return;
 
       // TODO: does getSemanticsProvidingExpr make sense to use here?
       //      if (auto semanticExpression = init->getSemanticsProvidingExpr())
 
-      // Handle DeclRefExpr
       if (auto DRE = dyn_cast<DeclRefExpr>(init)) {
+        // Handle DeclRefExpr
         WeakToStrongCaptureItems.push_back(
             {VD, referencedDecl, DRE, ownership});
-        //        NonStrongToStrongCaptureListDeclRefs.insert(DRE);
-        //        CaptureListDeclRefsToPBD[DRE] = PBD;
       } else if (auto IIO = dyn_cast<InjectIntoOptionalExpr>(init)) {
         // Handle InjectIntoOptionalExpr
         if (auto DRE = dyn_cast<DeclRefExpr>(IIO->getSubExpr())) {
           WeakToStrongCaptureItems.push_back(
               {VD, referencedDecl, DRE, ownership});
-          //          NonStrongToStrongCaptureListDeclRefs.insert(DRE);
-          //          CaptureListDeclRefsToPBD[DRE] = PBD;
-          //          WeakToStrongCaptureItems.push_back({VD, referencedDecl,
-          //          DRE, ownership});
         }
       }
     }
 
     void diagnoseImplicitCaptureListOwnershipEscalation() {
-      // Go through the list of 'weakified' capture list DeclRefs and check
+      // TODO: is this the simplest algorithm for this?
+      // Go through the list of 'weakified' capture list items and check
       // for ones that reference a Decl for which:
-      // - There exists an escaping closure in the DeclContext hierarchy
-      //   from the capture list entry to the corresponding Decl's context.
-      // TODO: is this (below) overly complicated? shall we exclude
-      // - Every ACE DC b/w the DeclRefExpr & the Decl has no other
-      // non-capture-list
-      //   references to the decl
+      // -  There exists an escaping closure in the DeclContext hierarchy
+      //    from the capture list entry to the corresponding Decl's context.
+      // -  Every closure DeclContext between the capture list item & its
+      //    referenced Decl has no other references to the Decl other than
+      //    possibly other weakified capture list item bindings.
       for (auto captureItem : WeakToStrongCaptureItems) {
-        LLVM_DEBUG(
-            llvm::dbgs() << "[iwtsc]: inspecting non-strong capture at: ";
-            captureItem.itemDecl->getLoc().print(llvm::dbgs(), Ctx.SourceMgr);
-            llvm::dbgs() << "\n");
-
         auto captureListItemReferent = captureItem.itemReferent;
-
-        LLVM_DEBUG(llvm::dbgs()
-                       << "[iwtsc]: referenced decl: '"
-                       << captureListItemReferent->getName() << "' at: ";
-                   captureListItemReferent->getLoc().print(llvm::dbgs(),
-                                                           Ctx.SourceMgr);
-                   llvm::dbgs() << "\n");
-        LLVM_DEBUG(llvm::dbgs()
-                   << "DC: " << captureListItemReferent->getDeclContext()
-                   << "\n");
-
-        bool isCaptureOnlyReferencedByCaptureLists = true;
+        bool weakifiedCaptureHasExplicitUse = false;
         std::optional<AbstractClosureExpr *> ancestorEscapingClosure;
 
         // Capture list entry's DC is the parent DC of the corresponding closure
@@ -2734,7 +2728,7 @@ static void diagnoseImplicitWeakToStrongCapture(const Expr *E,
 
         DeclContext *curDC = captureItem.itemDecl->getDeclContext();
         while (curDC && curDC != captureListItemReferent->getDeclContext() &&
-               isCaptureOnlyReferencedByCaptureLists) {
+               !weakifiedCaptureHasExplicitUse) {
           SWIFT_DEFER { curDC = curDC->getParent(); };
           
           if (!isa<AbstractClosureExpr>(curDC))
@@ -2743,36 +2737,21 @@ static void diagnoseImplicitWeakToStrongCapture(const Expr *E,
           auto ACE = cast<AbstractClosureExpr>(curDC);
 
           // We found an escaping closure.
-          if (!ACE->getType()->isNoEscape()) {
-            // If the referenced Decl is one of this closure's
-            // capture list items, ignore it. Our algorithm
-            // doesn't quite work for capture list entries since their DC
-            // is the parent of the corresponding closure.
-            if (auto VD = dyn_cast<VarDecl>(captureListItemReferent))
-              if (auto CLE = VD->getParentCaptureList())
-                if (CLE->getClosureBody() == ACE) {
-                  LLVM_DEBUG(llvm::dbgs()
-                             << "[iwtsc]: skipping escaping closure with "
-                                "referenced decl in capture list\n");
-                  continue;
-                }
-
+          // Check to ensure that:
+          // If the referenced Decl is one of this closure's
+          // capture list items, ignore it. Our algorithm
+          // doesn't quite work for capture list entries since their DC
+          // is the parent of the corresponding closure.
+          if (isEscapingClosure(ACE) &&
+              !isDeclACaptureListItemOfClosure(captureListItemReferent, ACE)) {
             ancestorEscapingClosure = ACE;
-
-            LLVM_DEBUG(llvm::dbgs()
-                       << "[iwtsc]: found ESC closure DC in path for: "
-                       << captureListItemReferent->getName() << "\n");
-            LLVM_DEBUG(llvm::dbgs() << "[iwtsc]: first esc closure: ";
-                       ACE->getLoc().print(llvm::dbgs(), Ctx.SourceMgr);
-                       llvm::dbgs() << "\n");
           }
 
           // Check for additional references to the capture list item's referent
           // within the current closure context.
           for (auto DRE : ClosuresToDeclRefs[ACE]) {
             // If the reference doesn't refer to the relevant Decl, ignore it
-            auto referencedDecl = DRE->getReferencedDecl().getDecl();
-            if (referencedDecl != captureListItemReferent)
+            if (DRE->getReferencedDecl().getDecl() != captureListItemReferent)
               continue;
             
             // If the reference is a member of the set of 'weakified' captures
@@ -2783,26 +2762,15 @@ static void diagnoseImplicitWeakToStrongCapture(const Expr *E,
                               return item.itemInitDRE == DRE;
                             }))
               continue;
-            
-            // if this ACE has an explicit capture TODO: fix logic
 
-            LLVM_DEBUG(llvm::dbgs()
-                           << "[iwtsc]: found additional reference to '"
-                           << captureListItemReferent->getName() << "' at: ";
-                       DRE->getLoc().print(llvm::dbgs(), Ctx.SourceMgr);
-                       llvm::dbgs() << "\n");
-
-            isCaptureOnlyReferencedByCaptureLists = false;
+            weakifiedCaptureHasExplicitUse = true;
             break;
           }
-
-          if (!isCaptureOnlyReferencedByCaptureLists)
-            break;
         }
 
         // Diagnose that reference ownership may be unexpectedly escalated due to a
         // nested weak capture list entry.
-        if (isCaptureOnlyReferencedByCaptureLists &&
+        if (!weakifiedCaptureHasExplicitUse &&
             ancestorEscapingClosure.has_value()) {
           Ctx.Diags.diagnose(captureItem.itemInitDRE->getLoc(),
                              diag::implicit_nonstrong_to_strong_capture,
@@ -2814,9 +2782,6 @@ static void diagnoseImplicitWeakToStrongCapture(const Expr *E,
         }
       }
     }
-
-  public:
-    DiagnoseWalker(ASTContext &ctx) : Ctx(ctx) {}
 
     PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
       if (!E || isa<ErrorExpr>(E) || !E->getType())
@@ -2847,34 +2812,15 @@ static void diagnoseImplicitWeakToStrongCapture(const Expr *E,
 
     PreWalkAction walkToDeclPre(Decl *D) override {
       // Check for capture list entries to record info about them
-      recordCaptureListDeclIfNeeded(D);
+      recordWeakifiedCaptureListDeclIfNeeded(D);
       return Action::Continue();
     }
   };
-  
+
   DiagnoseWalker Walker(DC->getASTContext());
   const_cast<Expr *>(E)->walk(Walker);
-  
+
   Walker.diagnoseImplicitCaptureListOwnershipEscalation();
-
-  LLVM_DEBUG(llvm::dbgs() << "[iwtsc]: ACEToDRE size: "
-                          << Walker.ClosuresToDeclRefs.size() << "\n");
-
-  LLVM_DEBUG(for (auto pair
-                  : Walker.ClosuresToDeclRefs) {
-    auto ACE = pair.first;
-    llvm::dbgs() << "[iwtsc]: ACE: ";
-
-    ASTContext &Ctx = DC->getASTContext();
-    ACE->getLoc().print(llvm::dbgs(), Ctx.SourceMgr);
-    llvm::dbgs() << "\n";
-
-    llvm::dbgs() << "[iwtsc]: DREs: ";
-    for (auto DRE : pair.second) {
-      DRE->getLoc().print(llvm::dbgs(), Ctx.SourceMgr);
-      llvm::dbgs() << "\n";
-    }
-  });
 }
 
 bool TypeChecker::getDefaultGenericArgumentsString(
