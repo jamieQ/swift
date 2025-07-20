@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 import Swift
+import Synchronization
 
 #if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
 /// An asynchronous sequence generated from a closure that calls a continuation
@@ -336,20 +337,40 @@ public struct AsyncStream<Element> {
     unfolding produce: @escaping @Sendable () async -> Element?,
     onCancel: (@Sendable () -> Void)? = nil
   ) {
-    let storage: _AsyncStreamCriticalStorage<Optional<() async -> Element?>>
-      = .create(produce)
-    context = _Context {
-      return await withTaskCancellationHandler {
-        guard let result = await storage.value?() else {
-          storage.value = nil
-          return nil
+//#if swift(>=6.0)
+// this branch is seemingly not taken in the `async_stream.swift` tests when using #if swift(>=6.0)
+    if #available(SwiftStdlib 6.0, *) {
+      let storage = Mutex(Optional(produce))
+      context = _Context {
+        return await withTaskCancellationHandler {
+          guard let result = await storage.withLock({ $0 })?() else {
+            _ = storage.withLock { $0.take() }
+            return nil
+          }
+          return result
+        } onCancel: {
+          _ = storage.withLock { $0.take() }
+          onCancel?()
         }
-        return result
-      } onCancel: {
-        storage.value = nil
-        onCancel?()
+      }
+    } else {
+      //#else
+      let storage: _AsyncStreamCriticalStorage<Optional<() async -> Element?>>
+      = .create(produce)
+      context = _Context {
+        return await withTaskCancellationHandler {
+          guard let result = await storage.value?() else {
+            storage.value = nil
+            return nil
+          }
+          return result
+        } onCancel: {
+          storage.value = nil
+          onCancel?()
+        }
       }
     }
+//#endif
   }
 }
 
